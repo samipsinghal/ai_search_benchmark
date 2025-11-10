@@ -89,7 +89,7 @@ python -m scripts.search_to_run \
   --page_table data/page_table.tsv
 
 # TREC DL 2020
-python -m scripts.search_to_run \
+python -m scripts.search_to_run \   
   --index_dir index/final \
   --queries   data/queries.eval.tsv \
   --run_out   runs/S1_bm25.eval2.trec \
