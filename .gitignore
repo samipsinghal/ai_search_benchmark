@@ -2,13 +2,11 @@ __pycache__/
 *.pyc
 .vscode/
 .idea/
-data/
 index/
 runs/
 *.h5
 *.bin
 *.tsv
-*.trec
 .DS_Store
 venv/
 .env/

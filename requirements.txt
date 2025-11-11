@@ -1,0 +1,22 @@
+# Core numerical and data libraries
+numpy>=1.23.0
+scipy>=1.10.0
+
+# Data serialization and HDF5 I/O
+h5py>=3.8.0
+
+# Approximate nearest neighbor search
+faiss-cpu>=1.7.4
+
+# Progress bar for loops
+tqdm>=4.65.0
+
+# Process and memory monitoring
+psutil>=5.9.5
+
+# Information retrieval metrics and evaluation
+pytrec_eval>=0.5
+
+# Optional (used by some utilities or plotting)
+pandas>=2.0.0
+matplotlib>=3.8.0

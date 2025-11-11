@@ -10,6 +10,10 @@ Tolerates messy TSVs (blank lines, space-delimited rows, headers).
 """
 
 import os, sys, heapq, argparse
+import time, psutil, os
+
+start = time.time()
+proc = psutil.Process(os.getpid())
 
 # --- ensure repo root on sys.path so 'from src...' works either as -m or script ---
 _ROOT = os.path.dirname(os.path.abspath(os.path.join(__file__, "..")))
@@ -151,4 +155,12 @@ def main():
     )
 
 if __name__ == "__main__":
-    main()
+    import time, psutil, os
+    start = time.time()
+    proc = psutil.Process(os.getpid())
+
+    main()   # existing function call
+
+    end = time.time()
+    mem = proc.memory_info().rss / (1024 * 1024)
+    print(f"[TIME] {end - start:.2f}s | [MEM] {mem:.1f} MB")

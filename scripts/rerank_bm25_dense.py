@@ -110,4 +110,14 @@ def main():
     print(f"[OK] wrote reranked run -> {args.run_out}")
 
 if __name__ == "__main__":
-    main()
+
+    import time, psutil, os
+    start = time.time()
+    proc = psutil.Process(os.getpid())
+
+    main()   # existing function call
+
+    end = time.time()
+    mem = proc.memory_info().rss / (1024 * 1024)
+    print(f"[TIME] {end - start:.2f}s | [MEM] {mem:.1f} MB")
+    

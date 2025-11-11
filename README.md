@@ -1,392 +1,160 @@
-# ai_search_ranking
-Small inverted-index search engine using Python  
-Implements parser → run merger → BM25 query processor.
-
-
-#  BM25 Search Engine – CS-GY 6913 (Web Search Engines)
-
-This repo contains my implementation of a small-scale search system built for **CS-GY 6913 (Web Search Engines)** at NYU , Fall 2025.  
-The goal of the assignment was to design and implement an end-to-end retrieval engine—from raw text to ranked results—using an inverted index and the BM25 ranking function.
-
----
-
-##  Overview  
-
-This project implements a full end-to-end **retrieval system**:  
-from text preprocessing and inverted-index construction to ranking, evaluation, and efficiency reporting.
-
-It follows the classical **Information Retrieval pipeline** but in modern Pythonic form — readable, modular, and measurable.
-
-collection.tsv → index_build → index_merge → query_bm25 → evaluation
-
-
----
-
-## Architecture  
-
-**Core pipeline**
-| Stage | Script | Purpose |
-|-------|---------|----------|
-| 1 Index Build | `src/index_build.py` | Parses the corpus, tokenizes text, and writes sorted partial runs. |
-| 2 Index Merge | `src/index_merge.py` | Merges all runs into a compressed inverted index (VarByte encoding). |
-| 3 Query Engine | `src/query_bm25.py` | Runs interactive BM25 search with snippet and text display. |
-| 4 Batch Search | `scripts/search_to_run.py` | Runs all queries in bulk and saves TREC-style run files. |
-| 5 Effectiveness | `scripts/report_effectiveness.py` | Evaluates MRR, nDCG, Recall using `pytrec_eval`. |
-| 6 Efficiency | `scripts/report_efficiency.py` | Reports latency, index size, and throughput statistics. |
-| 7 Query Download | `scripts/download_msmarco_queries.py` | Fetches MS MARCO v1.1 dev/test query sets and qrels. |
-
-**Libraries used:**  
-Python 3.12, `pandas`, `pytrec_eval`, `datasets`, and standard library modules only.
-
-
-## Implementation Optimizations
-
-This section summarizes the design choices and micro-optimizations that improve **latency**, **I/O**, and **space usage** in the system. References point to the relevant source files.
-
-### 1) Tokenization & Parsing
-- **Lowercase alphanumeric tokenizer** (`src/common.py`): uses a precompiled regex `[A-Za-z0-9]+` and an HTML stripper that ignores `<script>/<style>`.  
-  *Why:* stable, fast, and aligned with typical MS MARCO “bag of words” preprocessing; avoids unicode corner cases without crashing.
-
-### 2) I/O-Efficient Index Construction (External Merge)
-- **Run generation** (`src/index_build.py`): processes the corpus in configurable batches (`--batch_docs`), spills sorted triples `(term, docid, tf)` to disk as `run_*.tsv`.  
-  *Why:* prevents unbounded memory growth on large corpora and keeps per-spill sort cheap.
-- **K-way merge** (`src/index_merge.py`): streams all runs with heap-merged `(term, docid)` order via lightweight `Cursor`s; never materializes full postings in memory.  
-  *Why:* minimizes peak RSS while preserving sequential disk access patterns.
-
-### 3) Compression & On-Disk Layout
-- **Delta + VarByte** (`src/varbyte.py`, `src/index_merge.py`):  
-  - DocIDs are **delta-encoded** and then **variable-byte** compressed.  
-  - Term frequencies are **VarByte** compressed.  
-  - Per term block layout (little-endian):
-    ```
-    [df:uint32]
-    [docids_len:uint32][docid_deltas_varbyte...]
-    [tfs_len:uint32]   [tf_varbyte...]
-    ```
-  *Why:* delta coding yields 50–80% fewer bytes for monotonically increasing docIDs; VarByte is simple, CPU-light, and fast to decode.
-
-- **Separated streams** (docIDs and TFs stored in separate contiguous slices).  
-  *Why:* enables decoding only what is needed and better cache locality during DAAT traversal.
-
-- **Binary metadata file (`lexicon.tsv`)**: stores `term, df, offset, length`.  
-  *Why:* allows direct `seek(offset)` + `read(length)` per term with no scanning.
-
-- **Doc length sidecar (`doclen.bin`)**: contiguous `uint32` array, little-endian.  
-  *Why:* O(1) random access by docid during BM25 scoring with minimal RAM.
-
-**Result on 100k MS MARCO sample (for reference):**
-
-
-postings.bin ≈ 9.89 MB
-lexicon.tsv ≈ 2.16 MB
-doclen.bin ≈ 0.38 MB
-TOTAL ≈ 12.43 MB
-
-
-
-### 4) Query-Time Latency & I/O
-- **On-demand decoding** (`src/query_bm25.py::read_term_postings`):  
-  Performs `seek+read(length)` for exactly one term block, decodes minimally, and delta-expands in a tight loop.  
-  *Why:* avoids preloading or decompressing entire lists; reduces cache misses and page faults.
-
-- **DAAT scoring** (`score_disjunctive` / `score_conjunctive`):  
-  Uses a min-heap over list heads; advances only contributing iterators.  
-  *Why:* minimizes passes over large lists; benefits from already-sorted docIDs.
-
-- **Lightweight counters**: per-query **seeks** and **bytes read** are recorded; `scripts/report_efficiency.py` reports **mean / p50 / p90 / p95 / p99** latency and approximate throughput.  
-  *Why:* ties latency to I/O cost for principled tuning.
-
-**Observed single-term decode on this corpus:**
-
-
-mean ~0.00 ms (p95 ~0.01 ms); warm throughput ~360k decodes/sec
-
-(Real multi-term query latency depends on term df and posting lengths.)
-
-### 5) Data Types & Endianness
-- **Doc lengths:** `uint32` little-endian in `doclen.bin`.  
-  *Why:* compact, fixed-width, direct indexing with `struct.unpack('<I')`.
-- **Block headers (`df`, lengths):** `uint32` little-endian.  
-  *Why:* predictable structure and platform-agnostic serialization.
-- **Offsets/lengths in `lexicon.tsv`:** integers (bytes).  
-  *Why:* direct addressing without pointer chasing.
-
-### 6) BM25 Details
-- **Parameters:** default `k1=0.9`, `b=0.4` (interactive), tunable via CLI; batch evaluation often uses `k1≈1.2`, `b≈0.75` (MS MARCO baseline friendly).  
-  *Why:* exposes the classic efficiency–effectiveness trade-off while keeping code paths identical.
-
-### 7) Practical I/O Tricks
-- **Batch size control** during run generation (`--batch_docs`) to balance sort cost vs spill frequency.  
-- **Contiguous file layout** for postings to favor sequential reads when multiple term blocks are adjacent.  
-- **No gzip/bzip** of entire files (explicitly avoided): compression happens at the postings-block level so seeking stays O(1).
-
-### 8) Evaluation Depth & Output Size
-- **`--topk`** in `scripts/search_to_run.py` controls results per query:  
-  - `--topk 100` for fast iteration and `MRR@10`/`nDCG@10`.  
-  - `--topk 1000` for `Recall@1000` and full baselines.  
-  *Why:* shallow runs are faster and smaller; deeper runs enable recall-oriented metrics.
-
-### 9) Typical Baseline (MS MARCO Dev)
-With correct tokenization and ID alignment:
-- **MRR@10** ≈ 0.19–0.21  
-- **nDCG@10** ≈ 0.22–0.24  
-- **Recall@1000** ≈ 0.85–0.90
-
-Use:
-
-```bash 
-
-PYTHONPATH=. python -u scripts/search_to_run.py \
-  --index_dir index/final \
-  --queries data/queries.dev.tsv \
-  --run_out runs/dev_run.trec \
-  --k1 1.2 --b 0.75 --mode disj --topk 1000
-
-PYTHONPATH=. python scripts/report_effectiveness.py \
-  --qrels data/qrels.dev.small.txt \
-  --run runs/dev_run.trec
-
-```
-
-### 10) Future Work (drop-in ideas)
-Block-max WAND or MaxScore to skip non-competitive documents.
-Static cache for head segments of frequent terms.
-PEF/SIMD-BP128 for faster integer decoding.
-Memory-mapped postings for OS-level readahead on repeated workloads.
-
-
----
-
-If you want, I can tailor that section with your exact measured p50/p95/p99 latencies from `scripts/report_efficiency.py` and add a small before/after table.
-
-
-
-
-
-
----
-
-## Directory Layout
-
-```text
-
-ai_search_ranking/
-├── data/
-│ ├── collection.sample100000.tsv
-│ ├── page_table.tsv
-│ ├── queries.dev.tsv
-│ └── qrels.dev.small.txt
-│
-├── index/
-│ ├── tmp/ # intermediate run_*.tsv
-│ └── final/ # merged + compressed index
-│ ├── postings.bin
-│ ├── lexicon.tsv
-│ └── doclen.bin
-│
-├── scripts/
-│ ├── download_data.py
-│ ├── download_msmarco_queries.py
-│ ├── report_efficiency.py
-│ ├── search_to_run.py
-│ └── report_effectiveness.py
-│
-├── src/
-│ ├── common.py
-│ ├── index_build.py
-│ ├── index_merge.py
-│ ├── query_bm25.py
-│ ├── llm_snippets.py
-│ └── varbyte.py
-│
-└── tests/
-└── test_tokenize.py
-
-
-```
-
-
----
-
-##  Setup
-
-```bash
-git clone https://github.com/<your-username>/ai_search_ranking.git
-cd ai_search_ranking
-
+AI Search Benchmark – End-to-End README
+
+0) Overview
+
+Compare three information retrieval (IR) systems on the MS MARCO Passage Ranking (v1) dataset:
+
+System	Description
+S1 – BM25	Sparse lexical retrieval (term-based inverted index)
+S2 – Dense Retrieval (HNSW)	Approximate nearest-neighbor search using FAISS HNSW (inner-product)
+S3 – BM25 → Dense Rerank	Hybrid pipeline: BM25 retrieval followed by dense embedding–based re-ranking
+
+Evaluated on:
+
+Split	Relevance	Metrics
+Dev	Binary (qrels.dev.tsv)	MAP, Recall@100
+Eval-1 (TREC DL 2019)	Graded (0-3)	MRR@10, NDCG@10/100, Recall@100
+Eval-2 (TREC DL 2020)	Graded (0-3)	MRR@10, NDCG@10/100, Recall@100
+1) Data Layout (data/)
+collection.tsv
+msmarco_passages_subset.tsv
+msmarco_passages_embeddings_subset.h5
+msmarco_queries_dev_eval_embeddings.h5
+queries.dev.tsv
+queries.dev.filtered.tsv         # subset aligned with qrels.dev.tsv
+queries.eval.tsv
+qrels.dev.tsv
+qrel.eval.one.tsv                # TREC DL’19
+qrel.eval.two.tsv                # TREC DL’20
+
+2) Environment Setup
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -U pip
+pip install faiss-cpu h5py numpy tqdm psutil pytrec_eval
 
-If you want to use the optional LLM-snippet feature:
-
-export OPENAI_API_KEY=sk-<your-key>
-
-```
-
-## Data
-You can either download MS MARCO data automatically or provide your own TSVs.
-
-```bash
-
-1. Download MS MARCO subset
-
-python -m scripts.download_msmarco_queries
-
-
-This creates:
-
-data/queries.dev.tsv
-data/qrels.dev.small.txt
-
-
-
-## Building the Index
-
-# Step 1: Build intermediate runs
-python -m src.index_build \
-  --input data/collection.sample100000.tsv \
-  --outdir index/tmp \
+3) Build BM25 Index (S1)
+PYTHONPATH=. python -m src.index_build \
+  --input data/collection.tsv \
+  --outdir index/final \
   --batch_docs 50000
 
-# Step 2: Merge runs and compress
-python -m src.index_merge \
-  --tmpdir index/tmp \
-  --outdir index/final
-
-```
-
-You’ll get:
-
-index/final/
- ├─ postings.bin   # compressed postings
- ├─ lexicon.tsv    # term→offset,length,df
- └─ doclen.bin     # doc length info
+4) Validate Subset Alignment & Create Page Table
+PYTHONPATH=. python -m scripts.validate_subset_alignment \
+  --collection data/collection.tsv \
+  --subset data/msmarco_passages_subset.tsv \
+  --h5 data/msmarco_passages_embeddings_subset.h5 \
+  --write_mapping data/page_table.tsv
 
 
-## Interactive Search (BM25)
-```bash
+This ensures that passage IDs in the H5 embedding file match those in collection.tsv.
 
-python -m src.query_bm25 \
+5) Build FAISS HNSW Index (S2)
+PYTHONPATH=. python -m scripts.build_hnsw \
+  --emb_h5 data/msmarco_passages_embeddings_subset.h5 \
+  --out_dir index/faiss_hnsw_M4C80 \
+  --M 4 --efC 80
+
+
+You can later tune M (4–8), efConstruction (50–200).
+
+6) Prepare Filtered Query Lists
+
+To align queries with their judged qrels:
+
+awk '{print $1}' data/qrels.dev.tsv | sort -u > data/qids.dev.txt
+awk 'NR==FNR{keep[$1];next} ($1 in keep)' data/qids.dev.txt data/queries.dev.tsv > data/queries.dev.filtered.tsv
+
+
+Repeat similarly for Eval-1 and Eval-2 if needed.
+
+7) Convert Qrels to TREC Format
+awk '{print $1,"0",$2,$3}' data/qrels.dev.tsv > data/qrels.dev.trec
+awk '{print $1,"0",$3,$4}' data/qrel.eval.one.tsv > data/qrels.eval.one.trec
+awk '{print $1,"0",$3,$4}' data/qrel.eval.two.tsv > data/qrels.eval.two.trec
+
+8) Runs & Evaluation
+8.1 BM25 (S1)
+
+Dev:
+
+PYTHONPATH=. python -m scripts.search_to_run \
   --index_dir index/final \
-  --collection data/collection.sample100000.tsv \
-  --page_table data/page_table.tsv \
-  --snippet --show_text
-
-```
-
-Example:
-
-credit score
- 1. doc=36513  score=17.58
-    └─ snippet: Both the Equifax **Credit** **Score** and the FICO **Score** are…
-    └─ text:    Both the Equifax Credit Score and the FICO Score are general-purpose models…
+  --queries data/queries.dev.filtered.tsv \
+  --run_out runs/S1_bm25.dev.trec \
+  --k1 0.9 --b 0.4 --mode disj --topk 1000 \
+  --page_table data/page_table.tsv
+trec_eval -m map -m recall.100 data/qrels.dev.trec runs/S1_bm25.dev.trec
 
 
-## Batch Evaluation Workflow
+Run analogous commands for Eval-1 and Eval-2.
 
-Step 1: Generate a run file (batch search)
+8.2 Dense Retrieval / HNSW (S2)
 
-```
+Dev Example:
 
-PYTHONPATH=. python -u scripts/search_to_run.py \
-  --index_dir index/final \
-  --queries data/queries.dev.tsv \
-  --run_out runs/dev_run.trec \
-  --k1 1.5 --b 0.75 --mode disj --topk 1000
-
-(--topk = results per query; use 100 for fast debug, 1000 for full recall)
-
-```
-
-Step 2: Evaluate effectiveness
+PYTHONPATH=. python -m scripts.search_hnsw \
+  --query_h5 data/msmarco_queries_dev_eval_embeddings.h5 \
+  --qid_key id --qemb_key embedding \
+  --index_dir index/faiss_hnsw_M4C80 \
+  --qid_list_tsv data/queries.dev.filtered.tsv \
+  --topk 1000 --efS 100 \
+  --run_out runs/S2_hnsw.dev.M4C80S100.trec --tag FAISS
 
 
-```
+Parameter Tuning:
 
-PYTHONPATH=. python scripts/report_effectiveness.py \
-  --qrels data/qrels.dev.small.txt \
-  --run runs/dev_run.trec
+M	efConstruction	efSearch	Trend
+4	50	50	Fastest / Lower recall
+4	80	100	Balanced (default)
+8	200	200	Best recall / Highest latency
+8.3 BM25 → Dense Rerank (S3)
 
-```
+Re-rank BM25 candidates with dense embeddings:
 
+PYTHONPATH=. python -m scripts.rerank_bm25_dense \
+  --bm25_run runs/S1_bm25.dev.trec \
+  --query_h5 data/msmarco_queries_dev_eval_embeddings.h5 \
+  --passage_h5 data/msmarco_passages_embeddings_subset.h5 \
+  --qid_list_tsv data/queries.dev.filtered.tsv \
+  --fusion dense \
+  --run_out runs/S3_rerank.dev.M4C80S100.trec --tag RERANK_DENSE
+trec_eval -m map -m recall.100 data/qrels.dev.trec runs/S3_rerank.dev.M4C80S100.trec
 
-Dataset: MS MARCO Passage Ranking.
-Code: Python 3.12.
-=======
-Output example:
+9) Aggregate All Results
 
-MRR@10     : 0.192
-nDCG@10    : 0.276
-Recall@100 : 0.421
-Recall@1000: 0.656
+The provided script summarizes all .trec outputs:
 
-
-### Efficiency Report
-
-Measure index size and latency:
-
-python -m scripts.report_efficiency
-
-Example output:
-
-Documents indexed : 100,000
-Unique terms      : 104,319
-Average doc length: 55.0 tokens
-Index size (MB)   : 12.4
-Single-term decode latency : mean=0.00 ms  p95=0.01 ms
-Throughput ≈ 360 k decodes/sec
+./benchmark_all.sh | tee results_summary.txt
 
 
-```bash
-samipsinghal@Mac ai_search_ranking % python -m scripts.report_efficiency \
-  --index_dir index/final \
-  --queries data/queries.dev.small.tsv \
-  --sample_n 10 \
-  --mode disj --k1 0.9 --b 0.4
-=== BM25 System Efficiency Report ===
+Produces a table like:
 
-Documents indexed : 8,841,823
-Unique terms      : 1,470,267
-Average doc length: 57.84 tokens
+Run	Qrels Type	MRR@10	Recall@100	NDCG@10	NDCG@100	MAP
+S1_bm25.dev	binary	0.379	0.757	0.425	0.462	0.381
+S2_hnsw.dev	binary	0.391	0.646	0.424	0.447	0.389
+S3_rerank.dev	binary	0.569	0.863	0.610	0.634	0.566
+10) Efficiency Measurement
 
-Index size (MB):
-  postings.bin : 804.84
-  lexicon.tsv  : 34.22
-  doclen.bin   : 33.73
-  TOTAL        : 872.79
+Each command can be timed with:
 
-Single-term decode latency over 100 random terms:
-  COLD-ish  mean=0.01 ms  p50=0.00  p90=0.01  p95=0.02  p99=0.30
-  WARM      mean=0.01 ms  p50=0.00  p90=0.00  p95=0.02  p99=0.24
+/usr/bin/time -v python -m scripts.search_to_run ...
 
 
-DISJ latency over 10 queries:
-  mean=46.84 ms  min=10.09  max=112.75
-  p50=44.47  p90=67.86  p95=90.30  p99=108.26
-  I/O per query (means): seeks=0.0, bytes=0
+and internally the scripts log:
+
+[TIME] 35.24s | [MEM] 680.3 MB
 
 
-```
+To estimate average latency:
 
-Baselines
+NUM=$(wc -l < data/queries.dev.filtered.tsv)
+echo "scale=3; <elapsed_seconds> / $NUM" | bc
 
-| Model                           |    MRR@10 | Notes                        |
-| ------------------------------- | --------: | ---------------------------- |
-| BM25 (this repo, k1=0.9 b=0.4)  |    ≈ 0.19 | 100 K MS MARCO subset        |
-| MS MARCO Official BM25 Baseline | 0.19–0.21 | Full collection (8.8 M docs) |
-| Dense (ANCE / MiniLM)           | 0.33–0.38 | For comparison only          |
-
-
-### Notes & Tips
-
-topk controls how many results per query are written; use 100 for speed, 1000 for full evaluation.
-Evaluation uses pytrec_eval (TREC style metrics).
-Efficiency and effectiveness can be run independently.
-LLM Snippets (src/llm_snippets.py) can generate contextual summaries for each top result.
-
-### Acknowledgments
-
-Course: CS-GY 6913 – Web Search Engines (Prof. Torsten Suel, NYU , Fall 2025)
-Dataset: MS MARCO Passage Ranking v1.1
-Implementation: Developed by Samip Singhal as part of the retrieval and ranking module.
+11) Troubleshooting
+Issue	Cause / Fix
+0.0000 scores	Wrong qrels format → check columns and --page_table
+Duplicate (qid, docid)	Run dedup: awk '!seen[$1,$3]++'
+declare: -A error	Use bash ./benchmark_all.sh instead of sh
+Missing psutil	pip install psutil
+FAISS not found	pip install faiss-cpu

@@ -117,7 +117,7 @@ def main():
     print(f"[INFO] Checking H5 order …")
     h5_ids = read_h5_ids(args.h5)
     if subset_ids == h5_ids:
-        print("[OK] H5 IDs are in the same order as subset.tsv ✅")
+        print("[OK] H5 IDs are in the same order as subset.tsv ")
     else:
         matches, k = sample_alignment(subset_ids, h5_ids)
         print(f"[WARN] H5 order differs ({matches}/{k} positions match). You may need explicit mapping.")
@@ -128,7 +128,7 @@ def main():
         with io.open(args.write_mapping, "w", encoding="utf-8") as f:
             for i, ext_id in enumerate(subset_ids[:len(coll_ids)]):
                 f.write(f"{i}\t{ext_id}\n")
-        print("[OK] page_table.tsv written successfully ✅")
+        print("[OK] page_table.tsv written successfully ")
     elif args.write_mapping and not internal:
         print("[SKIP] No mapping needed: collection already uses external passage IDs")
 

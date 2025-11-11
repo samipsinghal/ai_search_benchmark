@@ -73,4 +73,12 @@ def main():
     print(f"[OK] wrote {wrote} queries → {args.run_out} (qid_key={qid_key}, emb_key={qemb_key})")
 
 if __name__ == "__main__":
+    import time, psutil, os
+    start = time.time()
+    proc = psutil.Process(os.getpid())
+
     main()
+
+    end = time.time()
+    mem = proc.memory_info().rss / (1024 * 1024)
+    print(f"[TIME] {end - start:.2f}s | [MEM] {mem:.1f} MB")
